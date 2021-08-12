@@ -22,6 +22,10 @@ from cartography.classification.mnli_utils import AdaptedMnliMismatchedProcessor
 from cartography.classification.qnli_utils import AdaptedQnliProcessor
 from cartography.classification.snli_utils import SNLIProcessor
 from cartography.classification.winogrande_utils import WinograndeProcessor
+from cartography.classification.wnli_utils import AdaptedWnliProcessor
+from cartography.classification.rte_utils import AdaptedRteProcessor
+
+import pandas as pd
 
 
 glue_processors["snli"] = SNLIProcessor
@@ -29,20 +33,44 @@ glue_processors["mnli"] = AdaptedMnliProcessor
 glue_processors["mnli-mm"] = AdaptedMnliMismatchedProcessor
 glue_processors["qnli"] = AdaptedQnliProcessor
 glue_processors["winogrande"] = WinograndeProcessor
+glue_processors["wnli"] = AdaptedWnliProcessor
+glue_processors["rte"] = AdaptedRteProcessor
 
 glue_output_modes["snli"] = "classification"
 glue_output_modes["winogrande"] = "classification"
 
 
+
 class AdaptedInputFeatures(InputFeatures):
-    def __init__(self, input_ids, attention_mask=None, token_type_ids=None, label=None, example_id=None):
+    def __init__(self, input_ids, attention_mask=None, token_type_ids=None, label=None, example_id=None, lex = None,
+                 const=None, subs=None, original_idx=None):
         self.input_ids = input_ids
         self.attention_mask = attention_mask
         self.token_type_ids = token_type_ids
         self.label = label
         self.example_id = example_id
+        self.lex = lex
+        self.const = const
+        self.subs = subs
+        self.original_idx = original_idx
 
 
+def get_instance_heuristics(task, data_split):
+    mode = data_split
+    ### UNCOMMENT FOR MNLI
+    if 'dev' in data_split:
+        mode = 'dev'
+        if task.upper() == 'MNLI':
+            mode = 'dev_matched'
+
+    df = pd.read_csv("/home/jusun/adila001/{}/{}_heuristic.tsv".format(task.upper(), mode), delimiter="\t|\n")
+    lexical = df["lexical"].tolist()
+    if 'constituent' in set(df.columns):
+        constituent = df["constituent"].tolist()
+    else:
+        constituent = [0 for i in range(df.shape[0])]
+    subsequence = df["subsequence"].tolist()
+    return lexical, constituent, subsequence
 
 def adapted_glue_convert_examples_to_features(
     examples,
@@ -55,6 +83,8 @@ def adapted_glue_convert_examples_to_features(
     pad_token=0,
     pad_token_segment_id=0,
     mask_padding_with_zero=True,
+    heuristics=True,
+    data_split='train',
 ):
     """
     Adapted from `transformers`. New functionality: also return an integer ID for each example.
@@ -96,6 +126,12 @@ def adapted_glue_convert_examples_to_features(
     label_map = {label: i for i, label in enumerate(label_list)}
 
     features = []
+    lex = []
+    const= []
+    subs = []
+    if heuristics==True:
+        lex, const, subs = get_instance_heuristics(task, data_split)
+
     for (ex_index, example) in enumerate(examples):
         len_examples = 0
         if is_tf_dataset:
@@ -154,8 +190,11 @@ def adapted_glue_convert_examples_to_features(
                                  attention_mask=attention_mask,
                                  token_type_ids=token_type_ids,
                                  label=label,
-                                 example_id=example_int_id))
-
+                                 example_id=example_int_id,
+                                 lex=None if len(lex)==0 else lex[ex_index],
+                                 const=None if len(const)==0 else const[ex_index],
+                                 subs=None if len(const)==0else subs[ex_index],
+                                 original_idx=ex_index))
     if is_tf_available() and is_tf_dataset:
 
         def gen():
@@ -181,7 +220,6 @@ def adapted_glue_convert_examples_to_features(
                 tf.TensorShape([]),
             ),
         )
-
     return features
 
 

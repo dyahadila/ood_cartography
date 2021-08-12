@@ -32,7 +32,7 @@ import torch
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, TensorDataset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
-
+from transformers import ROBERTA_PRETRAINED_CONFIG_ARCHIVE_MAP
 from transformers import (
     WEIGHTS_NAME,
     AdamW,
@@ -42,7 +42,7 @@ from transformers import (
     RobertaTokenizer,
     get_linear_schedule_with_warmup,
 )
-
+# from transformers import WarmupLinearSchedule as get_linear_schedule_with_warmup
 from cartography.classification.glue_utils import adapted_glue_compute_metrics as compute_metrics
 from cartography.classification.glue_utils import adapted_glue_convert_examples_to_features as convert_examples_to_features
 from cartography.classification.glue_utils import glue_output_modes as output_modes
@@ -57,7 +57,7 @@ from cartography.classification.models import (
 from cartography.classification.multiple_choice_utils import convert_mc_examples_to_features
 from cartography.classification.params import Params, save_args_to_file
 
-from cartography.selection.selection_utils import log_training_dynamics
+from cartography.selection.selection_utils import log_training_dynamics, log_eval_dynamics
 
 
 try:
@@ -70,7 +70,7 @@ logger = logging.getLogger(__name__)
 
 ALL_MODELS = sum(
     (
-        tuple(conf.pretrained_config_archive_map.keys())
+        tuple(ROBERTA_PRETRAINED_CONFIG_ARCHIVE_MAP.keys())
         for conf in (
             BertConfig,
             RobertaConfig,
@@ -95,7 +95,7 @@ def set_seed(args):
         torch.cuda.manual_seed_all(args.seed)
 
 
-def train(args, train_dataset, model, tokenizer):
+def train(args, train_dataset, model, tokenizer, ood_dataset):
     """ Train the model """
     if args.local_rank in [-1, 0]:
         tb_writer = SummaryWriter()
@@ -213,6 +213,7 @@ def train(args, train_dataset, model, tokenizer):
         train_golds = None
         train_logits = None
         train_losses = None
+        predictions = None
         for step, batch in enumerate(epoch_iterator):
             # Skip past any already trained steps if resuming training
             if steps_trained_in_this_epoch > 0:
@@ -234,11 +235,17 @@ def train(args, train_dataset, model, tokenizer):
                 train_logits = outputs[1].detach().cpu().numpy()
                 train_golds = inputs["labels"].detach().cpu().numpy()
                 train_losses = loss.detach().cpu().numpy()
+                heuristics = batch[5].detach().cpu().numpy()
+                original_ids = batch[-1].detach().cpu().numpy()
+                predictions = np.argmax(train_logits, axis=1)
             else:
                 train_ids = np.append(train_ids, batch[4].detach().cpu().numpy())
                 train_logits = np.append(train_logits, outputs[1].detach().cpu().numpy(), axis=0)
                 train_golds = np.append(train_golds, inputs["labels"].detach().cpu().numpy())
                 train_losses = np.append(train_losses, loss.detach().cpu().numpy())
+                heuristics = np.vstack((heuristics, batch[5].detach().cpu().numpy()))
+                original_ids = np.append(original_ids, batch[-1].detach().cpu().numpy())
+                predictions = np.append(predictions, np.argmax(outputs[1].detach().cpu().numpy(), axis=1))
 
             if args.n_gpu > 1:
                 loss = loss.mean()  # mean() to average on multi-gpu parallel training
@@ -309,22 +316,32 @@ def train(args, train_dataset, model, tokenizer):
 
             epoch_iterator.set_description(f"lr = {scheduler.get_lr()[0]:.8f}, "
                                            f"loss = {(tr_loss-epoch_loss)/(step+1):.4f}")
-            if args.max_steps > 0 and global_step > args.max_steps:
-                epoch_iterator.close()
-                break
+            # if args.max_steps > 0 and global_step > args.max_steps:
+            #     epoch_iterator.close()
+            #     break
 
-        #### Post epoch eval ####
-        # Only evaluate when single GPU otherwise metrics may not average well
-        if args.local_rank == -1 and args.evaluate_during_training:
-            best_dev_performance, best_epoch = save_model(
-                args, model, tokenizer, epoch, best_epoch, best_dev_performance)
+        # #### Post epoch eval ####
+        # # Only evaluate when single GPU otherwise metrics may not average well
+        # if args.local_rank == -1 and args.evaluate_during_training:
+        #     best_dev_performance, best_epoch = save_model(
+        #         args, model, tokenizer, epoch, best_epoch, best_dev_performance)
+        # ### UNCOMMENT
 
         # Keep track of training dynamics.
         log_training_dynamics(output_dir=args.output_dir,
                               epoch=epoch,
                               train_ids=list(train_ids),
                               train_logits=list(train_logits),
-                              train_golds=list(train_golds))
+                              train_golds=list(train_golds),
+                              predictions=list(predictions),
+                              heuristics = heuristics,
+                              original_ids = original_ids)
+
+        # test on id and ood
+        evaluate(args, model, tokenizer, prefix="in_distribution_test", eval_split="dev", ep_num=epoch)
+        if ood_dataset != None:
+            evaluate(args, model, tokenizer, prefix="ood", ep_num=epoch, ood_test_set=ood_dataset)
+
         train_result = compute_metrics(args.task_name, np.argmax(train_logits, axis=1), train_golds)
         train_acc = train_result["acc"]
 
@@ -342,14 +359,14 @@ def train(args, train_dataset, model, tokenizer):
             tb_writer.add_scalar(key, value, global_step)
             logger.info(f"  {key}: {value:.6f}")
 
-        if args.max_steps > 0 and global_step > args.max_steps:
-            train_iterator.close()
-            break
-        elif args.evaluate_during_training and epoch - best_epoch >= args.patience:
-            logger.info(f"Ran out of patience. Best epoch was {best_epoch}. "
-                f"Stopping training at epoch {epoch} out of {args.num_train_epochs} epochs.")
-            train_iterator.close()
-            break
+        # if args.max_steps > 0 and global_step > args.max_steps:
+        #     train_iterator.close()
+        #     break
+        # elif args.evaluate_during_training and epoch - best_epoch >= args.patience:
+        #     logger.info(f"Ran out of patience. Best epoch was {best_epoch}. "
+        #         f"Stopping training at epoch {epoch} out of {args.num_train_epochs} epochs.")
+        #     train_iterator.close()
+        #     break
 
     if args.local_rank in [-1, 0]:
         tb_writer.close()
@@ -378,7 +395,7 @@ def save_model(args, model, tokenizer, epoch, best_epoch,  best_dev_performance)
     return best_dev_performance, best_epoch
 
 
-def evaluate(args, model, tokenizer, prefix="", eval_split="dev"):
+def evaluate(args, model, tokenizer, ep_num, prefix="", eval_split="dev", ood_test_set=None):
     # We do not really need a loop to handle MNLI double evaluation (matched, mis-matched).
     eval_task_names = (args.task_name,)
     eval_outputs_dirs = (args.output_dir,)
@@ -386,13 +403,15 @@ def evaluate(args, model, tokenizer, prefix="", eval_split="dev"):
     results = {}
     all_predictions = {}
     for eval_task, eval_output_dir in zip(eval_task_names, eval_outputs_dirs):
-        eval_dataset = load_and_cache_examples(
-            args, eval_task, tokenizer, evaluate=True, data_split=f"{eval_split}_{prefix}")
-
         if not os.path.exists(eval_output_dir) and args.local_rank in [-1, 0]:
             os.makedirs(eval_output_dir)
 
         args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
+        if ood_test_set == None:
+            eval_dataset = load_and_cache_examples(
+                args, eval_task, tokenizer, evaluate=True, data_split=eval_split, ood=False, heuristics=True)
+        else:
+            eval_dataset = ood_test_set
         # Note that DistributedSampler samples randomly
         eval_sampler = SequentialSampler(eval_dataset)
         eval_dataloader = DataLoader(
@@ -413,6 +432,9 @@ def evaluate(args, model, tokenizer, prefix="", eval_split="dev"):
 
         example_ids = []
         gold_labels = []
+        test_logits = []
+        original_ids = []
+        heuristics = []
 
         for batch in tqdm(eval_dataloader, desc="Evaluating", mininterval=10, ncols=100):
             model.eval()
@@ -432,13 +454,20 @@ def evaluate(args, model, tokenizer, prefix="", eval_split="dev"):
                 gold_labels += batch[3].tolist()
             nb_eval_steps += 1
             if preds is None:
+                test_logits = logits.detach().cpu().numpy()
                 preds = logits.detach().cpu().numpy()
                 out_label_ids = inputs["labels"].detach().cpu().numpy()
+                original_ids = batch[-1].detach().cpu().numpy()
+                # if ood_test_set== None:
+                heuristics = batch[-2].detach().cpu().numpy()
             else:
                 preds = np.append(preds, logits.detach().cpu().numpy(), axis=0)
                 out_label_ids = np.append(
                     out_label_ids, inputs["labels"].detach().cpu().numpy(), axis=0)
-
+                test_logits = np.append(test_logits, logits.detach().cpu().numpy(), axis=0)
+                original_ids = np.append(original_ids, batch[-1].detach().cpu().numpy())
+                # if ood_test_set== None:
+                heuristics = np.vstack((heuristics, batch[-2].detach().cpu().numpy()))
         eval_loss = eval_loss / nb_eval_steps
         if args.output_mode == "classification":
             probs = torch.nn.functional.softmax(torch.Tensor(preds), dim=-1)
@@ -451,7 +480,7 @@ def evaluate(args, model, tokenizer, prefix="", eval_split="dev"):
         results.update(result)
 
         output_eval_file = os.path.join(
-            eval_output_dir, f"eval_metrics_{eval_task}_{eval_split}_{prefix}.json")
+                eval_output_dir, f"eval_metrics_{eval_split}_{prefix}.json")
         logger.info(f"***** {eval_task} {eval_split} results {prefix} *****")
         for key in sorted(result.keys()):
             logger.info(f"{eval_task} {eval_split} {prefix} {key} = {result[key]:.4f}")
@@ -460,25 +489,49 @@ def evaluate(args, model, tokenizer, prefix="", eval_split="dev"):
 
         # predictions
         all_predictions[eval_task] = []
-        output_pred_file = os.path.join(
-            eval_output_dir, f"predictions_{eval_task}_{eval_split}_{prefix}.lst")
-        with open(output_pred_file, "w") as writer:
-            logger.info(f"***** Write {eval_task} {eval_split} predictions {prefix} *****")
-            for ex_id, pred, gold, max_conf, prob in zip(
-                example_ids, preds, gold_labels, max_confidences, probs.tolist()):
-                record = {"guid": ex_id,
-                          "label": processors[args.task_name]().get_labels()[pred],
-                          "gold": processors[args.task_name]().get_labels()[gold],
-                          "confidence": max_conf,
-                          "probabilities": prob}
-                all_predictions[eval_task].append(record)
-                writer.write(json.dumps(record) + "\n")
+        # output_pred_file = os.path.join(
+        #         eval_output_dir, f"predictions_{eval_split}_{prefix}_{ep_num}.lst")
 
+        # with open(output_pred_file, "w") as writer:
+        #     logger.info(f"***** Write {eval_task} {eval_split} predictions {prefix} *****")
+        #     for ex_id, pred, gold, max_conf, prob, logits, original_id in zip(
+        #         example_ids, preds, gold_labels, max_confidences, probs.tolist(), test_logits, original_ids):
+        #         record = {"guid": ex_id,
+        #                   # "label": processors[args.task_name]().get_labels()[pred],
+        #                   "gold": gold,
+        #                   # "confidence": max_conf,
+        #                   # "probabilities": prob,
+        #                   f"test_id_logits_epoch_{ep_num}": logits,
+        #                   "original_id": original_id,
+        #                   "predictions": pred}
+        #         print("IN DISTRIBUTION TEST LOG", record)
+        #         all_predictions[eval_task].append(record)
+        #         writer.write(json.dumps(record) + "\n")
+
+        ### uncomment for test on mnli @TODO: match logits shape of train and test for condition
+        if ood_test_set and 'mnli' in eval_task.lower():
+            test_logits, preds = process_ood_logits(test_logits)
+        print((ood_test_set == None), len(eval_dataset), test_logits.shape)
+        test_logits = test_logits.tolist()
+        log_eval_dynamics(output_dir=args.output_dir, epoch=ep_num, guids=example_ids,eval_logits=test_logits,
+                      eval_golds=gold_labels, original_ids = original_ids, predictions = preds, heuristics=heuristics,
+                          ood=(ood_test_set!=None))
     return results, all_predictions
 
+def process_ood_logits(logits):
+    new_logits = logits[:, 1].reshape((-1,1))
+    logits_to_process = np.take(logits, [0,2], axis = 1)
+    logits_to_process = np.amax(logits_to_process, axis = 1)
+    new_logits = np.hstack((logits_to_process.reshape((-1,1)), new_logits))
+    new_preds = np.argmax(new_logits, axis=1)
+    return new_logits, new_preds
 
-def load_dataset(args, task, eval_split="train"):
+
+def load_dataset(args, task, ood, eval_split="train"):
     processor = processors[task]()
+    if ood:
+        examples = processor.get_examples(args.ood_test_set, "dev")
+        return examples
     if eval_split == "train":
         if args.train is None:
             examples = processor.get_train_examples(args.data_dir)
@@ -496,7 +549,6 @@ def load_dataset(args, task, eval_split="train"):
             examples = processor.get_examples(args.test, "test")
     else:
         raise ValueError(f"eval_split should be train / dev / test, but was given {eval_split}")
-
     return examples
 
 
@@ -510,12 +562,14 @@ def get_winogrande_tensors(features):
     segment_ids = torch.tensor(select_field(features, "segment_ids"), dtype=torch.long)
     label_ids = torch.tensor([f.label for f in features], dtype=torch.long)
     example_ids = torch.tensor([f.example_id for f in features], dtype=torch.long)
+    original_idx = torch.tensor([f.original_idx for f in features], dtype=torch.int)
 
-    dataset = TensorDataset(input_ids, input_mask, segment_ids, label_ids, example_ids)
+    dataset = TensorDataset(input_ids, input_mask, segment_ids, label_ids, example_ids, original_idx)
     return dataset
 
 
-def load_and_cache_examples(args, task, tokenizer, evaluate=False, data_split="train"):
+def load_and_cache_examples(args, task, tokenizer, evaluate=False, data_split="train", ood=False, heuristics=False):
+    print('TASK', task)
     if args.local_rank not in [-1, 0] and not evaluate:
         # Make sure only the first process in distributed training process the dataset,
         # and the others will use the cache
@@ -535,7 +589,9 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False, data_split="t
             str(task),
         ),
     )
-    # Load data features from cache or dataset file
+    # Load data features f
+    # rom cache or dataset file
+
     if os.path.exists(cached_features_file) and not args.overwrite_cache:
         logger.info("Loading features from cached file %s", cached_features_file)
         features = torch.load(cached_features_file)
@@ -545,7 +601,7 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False, data_split="t
         if task in ["mnli", "mnli-mm"] and args.model_type in ["roberta", "xlmroberta"]:
             # HACK(label indices are swapped in RoBERTa pretrained model)
             label_list[1], label_list[2] = label_list[2], label_list[1]
-        examples = load_dataset(args, task, data_split)
+        examples = load_dataset(args, task, ood, data_split)
         if task == "winogrande":
             features = convert_mc_examples_to_features(
                 examples,
@@ -564,7 +620,10 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False, data_split="t
                 output_mode=output_mode,
                 pad_on_left=bool(args.model_type in ["xlnet"]),  # pad on the left for xlnet
                 pad_token=tokenizer.convert_tokens_to_ids([tokenizer.pad_token])[0],
-                pad_token_segment_id=4 if args.model_type in ["xlnet"] else 0,)
+                pad_token_segment_id=4 if args.model_type in ["xlnet"] else 0,
+                heuristics = heuristics and args.heuristics,
+                data_split=data_split,
+                task=task)
         if args.local_rank in [-1, 0]:
             logger.info("Saving features into cached file %s", cached_features_file)
             torch.save(features, cached_features_file)
@@ -586,8 +645,14 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False, data_split="t
         all_labels = torch.tensor([f.label for f in features], dtype=torch.long)
     elif output_mode == "regression":
         all_labels = torch.tensor([f.label for f in features], dtype=torch.float)
-
-    dataset = TensorDataset(all_input_ids, all_attention_mask, all_token_type_ids, all_labels, all_example_ids)
+    all_original_ids = torch.tensor([f.original_idx for f in features], dtype=torch.int)
+    if heuristics == True:
+        all_heuristics = torch.transpose(torch.tensor([[f.lex for f in features],[f.const for f in features],[f.subs for f in features]],
+                                                  dtype=torch.int),0,1)
+        dataset = TensorDataset(all_input_ids, all_attention_mask, all_token_type_ids, all_labels, all_example_ids, all_heuristics, all_original_ids)
+    else:
+        dataset = TensorDataset(all_input_ids, all_attention_mask, all_token_type_ids, all_labels, all_example_ids,
+                                all_original_ids)
     return dataset
 
 
@@ -690,9 +755,16 @@ def run_transformer(args):
             os.makedirs(args.output_dir)
             save_args_to_file(args, mode="train")
 
-        train_dataset = load_and_cache_examples(args, args.task_name, tokenizer, evaluate=False)
-        global_step, tr_loss = train(args, train_dataset, model, tokenizer)
-        logger.info(f" global_step = {global_step}, average loss = {tr_loss:.4f}")
+        train_dataset = load_and_cache_examples(args, args.task_name, tokenizer, evaluate=False, ood=False, heuristics=args.heuristics)
+        if args.ood_test_set:
+            task_name = args.ood_test_set.split('/')[-2].lower()
+            ood_dataset = load_and_cache_examples(args, task_name, tokenizer, evaluate=False, ood=True, heuristics=args.heuristics)
+
+            global_step, tr_loss = train(args, train_dataset, model, tokenizer, ood_dataset)
+            logger.info(f" global_step = {global_step}, average loss = {tr_loss:.4f}")
+        else:
+            global_step, tr_loss = train(args, train_dataset, model, tokenizer)
+            logger.info(f" global_step = {global_step}, average loss = {tr_loss:.4f}")
 
     # Saving best-practices: if you use defaults names for the model,
     # you can reload it using from_pretrained()
@@ -778,8 +850,29 @@ def main():
                         help="Whether to run eval on the (OOD) test set.")
     parser.add_argument("--test",
                         type=os.path.abspath,
-                        help="OOD test set.")
-
+                        help="ID test set path.")
+    parser.add_argument("--train",
+                        type=os.path.abspath,
+                        help="Custom train set path.")
+    parser.add_argument("--heuristics",
+                        "-heu",
+                        action="store_true",
+                        required=False,
+                        help="With heuristics or not.")
+    parser.add_argument("--overwrite_output_dir",
+                        "-ovrwrt",
+                        action="store_true",
+                        required=False,
+                        help="Overwrite output directory.")
+    parser.add_argument("--overwrite_cache",
+                        "-ovr_cache",
+                        action="store_true",
+                        required=False,
+                        help="Overwrite cache directory.")
+    parser.add_argument("--ood_test_set",
+                        "-ood",
+                        required=False,
+                        help="OOD test set path")
     # TODO(SS): Automatically map tasks to OOD test sets.
 
     args_from_cli = parser.parse_args()

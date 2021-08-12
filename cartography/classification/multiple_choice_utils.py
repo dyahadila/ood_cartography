@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 class MCInputExample(object):
     """A single training/test example for multiple choice"""
 
-    def __init__(self, example_id, question, contexts, endings, label=None):
+    def __init__(self, example_id, question, contexts, endings, label=None,):
         """Constructs an MCInputExample.
 
         Args:
@@ -36,13 +36,14 @@ class MCInputExample(object):
 
 
 class MCInputFeatures(object):
-    def __init__(self, example_id, choices_features, label):
+    def __init__(self, example_id, choices_features, label, original_idx,):
         self.example_id = example_id
         self.choices_features = [
             {"input_ids": input_ids, "input_mask": input_mask, "segment_ids": segment_ids}
             for input_ids, input_mask, segment_ids in choices_features
         ]
         self.label = label
+        self.original_idx = original_idx
 
 
 def convert_mc_examples_to_features(
@@ -121,6 +122,7 @@ def convert_mc_examples_to_features(
 
         features.append(MCInputFeatures(example_id=example.example_id,
                                         choices_features=choices_features,
-                                        label=label,))
+                                        label=label,
+                                        original_idx=ex_index))
 
     return features

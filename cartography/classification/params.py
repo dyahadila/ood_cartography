@@ -145,6 +145,12 @@ class Params:
       self.server_ip : str = configs.get("server_ip", "")
       self.server_port : str = configs.get("server_port", "")
 
+      #For heuristics
+      self.heuristics : bool = configs.get("heuristics", True)
+
+      #For OOD test set path
+      self.ood_test_set : str = configs.get("ood_test_set", "")
+
 
 def save_args_to_file(params: Params, mode: str = ""):
   """
